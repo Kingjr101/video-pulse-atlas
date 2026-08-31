@@ -1,138 +1,48 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CountryDrawer } from "@/components/CountryDrawer";
+import type {
+  CountryFeature,
+  CountrySummary,
+  GeoDataset,
+  YouTubeDataset,
+} from "@/types";
 
 const Globe = dynamic(() => import("react-globe.gl"), {
   ssr: false,
 });
 
-type ChartVideo = {
-  rank: number;
-  video_id: string;
-  title: string;
-  channel_name: string;
-  category_name: string;
-  thumbnail_url: string | null;
-  global_view_count: number;
-  countries_charting: number;
-};
+function getCountryCode(feature: CountryFeature): string | null {
+  const preferred = feature.properties.ISO_A2_EH;
+  const standard = feature.properties.ISO_A2;
 
-type CategoryScore = {
-  category_name: string;
-  rank_points: number;
-};
-
-type CountrySummary = {
-  country_code: string;
-  country_name: string;
-  dominant_category: string;
-  category_scores: CategoryScore[];
-  top_video: ChartVideo;
-  top_videos: ChartVideo[];
-};
-
-type GlobalTrend = {
-  video_id: string;
-  title: string;
-  channel_name: string;
-  category_name: string;
-  countries_charting: number;
-  best_rank: number;
-  average_rank: number;
-};
-
-type YouTubeDataset = {
-  generated_at: string;
-  country_count: number;
-  video_count: number;
-  failed_country_count: number;
-  countries: Record<string, CountrySummary>;
-  global_trends: GlobalTrend[];
-};
-
-type CountryFeature = {
-  type: "Feature";
-  properties: Record<string, unknown>;
-  geometry: unknown;
-};
-
-type GeoDataset = {
-  type: "FeatureCollection";
-  features: CountryFeature[];
-};
-
-const CATEGORY_COLORS: Record<string, string> = {
-  Music: "#ff4f9a",
-  Entertainment: "#9b6dff",
-  Gaming: "#31b7ff",
-  "Film & Animation": "#ff9d47",
-  Sports: "#42d392",
-  Comedy: "#ffd166",
-  News: "#ff6464",
-  "News & Politics": "#ff6464",
-  Education: "#4dd4c6",
-  "People & Blogs": "#e879f9",
-};
-
-function getCategoryColor(category?: string) {
-  if (!category) {
-    return "#263044";
+  if (typeof preferred === "string" && preferred !== "-99") {
+    return preferred;
   }
 
-  if (CATEGORY_COLORS[category]) {
-    return CATEGORY_COLORS[category];
-  }
-
-  let hash = 0;
-
-  for (const character of category) {
-    hash = character.charCodeAt(0) + ((hash << 5) - hash);
-  }
-
-  return `hsl(${Math.abs(hash) % 360} 70% 58%)`;
-}
-
-function getCountryCode(feature: CountryFeature) {
-  const preferredCode = feature.properties.ISO_A2_EH;
-  const standardCode = feature.properties.ISO_A2;
-
-  if (
-    typeof preferredCode === "string" &&
-    preferredCode !== "-99"
-  ) {
-    return preferredCode;
-  }
-
-  if (
-    typeof standardCode === "string" &&
-    standardCode !== "-99"
-  ) {
-    return standardCode;
+  if (typeof standard === "string" && standard !== "-99") {
+    return standard;
   }
 
   return null;
 }
 
-function getCountryName(feature: CountryFeature) {
+function getCountryName(feature: CountryFeature): string {
   const properties = feature.properties;
 
-  const possibleNames = [
-    properties.NAME_EN,
-    properties.NAME,
-    properties.ADMIN,
-  ];
-
-  for (const name of possibleNames) {
-    if (typeof name === "string") {
-      return name;
+  for (const key of ["NAME_EN", "NAME", "ADMIN"] as const) {
+    const value = properties[key];
+    if (typeof value === "string") {
+      return value;
     }
   }
 
   return "Unknown country";
 }
 
-function escapeHtml(value: string) {
+function escapeHtml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -141,32 +51,60 @@ function escapeHtml(value: string) {
     .replaceAll("'", "&#039;");
 }
 
-function formatNumber(value: number) {
-  return new Intl.NumberFormat("en", {
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(value);
+type LngLat = [number, number];
+
+/** Flatten a Polygon / MultiPolygon feature into a list of boundary rings. */
+function extractRings(feature: CountryFeature): LngLat[][] {
+  const geometry = feature.geometry as {
+    type?: string;
+    coordinates?: unknown;
+  } | null;
+
+  if (!geometry || !Array.isArray(geometry.coordinates)) {
+    return [];
+  }
+
+  const rings: LngLat[][] = [];
+
+  if (geometry.type === "Polygon") {
+    for (const ring of geometry.coordinates as LngLat[][]) {
+      rings.push(ring);
+    }
+  } else if (geometry.type === "MultiPolygon") {
+    for (const polygon of geometry.coordinates as LngLat[][][]) {
+      for (const ring of polygon) {
+        rings.push(ring);
+      }
+    }
+  }
+
+  return rings;
 }
 
-function formatSnapshotDate(value: string) {
-  return new Intl.DateTimeFormat("en", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(new Date(value));
+// three-globe path points are [lat, lng]; GeoJSON coordinates are [lng, lat].
+function ringToPath(ring: LngLat[]): LngLat[] {
+  return ring.map(([lng, lat]) => [lat, lng]);
 }
+
+type BorderPath = {
+  points: LngLat[];
+  kind: "border" | "glow" | "core";
+};
 
 export default function Home() {
   const [dataset, setDataset] = useState<YouTubeDataset | null>(null);
   const [geoData, setGeoData] = useState<GeoDataset | null>(null);
-  const [selectedCode, setSelectedCode] = useState("CA");
+  const [selectedCode, setSelectedCode] = useState<string | null>(null);
+  const [drawerCountry, setDrawerCountry] = useState<CountrySummary | null>(
+    null,
+  );
+  const [hoverCode, setHoverCode] = useState<string | null>(null);
+  const [hasInteracted, setHasInteracted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [globeSize, setGlobeSize] = useState({
-    width: 760,
-    height: 650,
-  });
+  const [size, setSize] = useState({ width: 960, height: 720 });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const globeRef = useRef<any>(null);
 
   useEffect(() => {
     Promise.all([
@@ -174,14 +112,12 @@ export default function Home() {
         if (!response.ok) {
           throw new Error("Could not load YouTube chart data.");
         }
-
         return response.json();
       }),
       fetch("/data/countries.geojson").then((response) => {
         if (!response.ok) {
           throw new Error("Could not load country boundaries.");
         }
-
         return response.json();
       }),
     ])
@@ -195,72 +131,246 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    function updateGlobeSize() {
-      const isDesktop = window.innerWidth >= 1000;
-
-      setGlobeSize({
-        width: isDesktop
-          ? Math.floor(window.innerWidth * 0.62)
-          : Math.max(340, window.innerWidth - 32),
-        height: isDesktop ? 650 : 470,
-      });
+    function updateSize() {
+      setSize({ width: window.innerWidth, height: window.innerHeight });
     }
 
-    updateGlobeSize();
-    window.addEventListener("resize", updateGlobeSize);
+    updateSize();
+    window.addEventListener("resize", updateSize);
 
-    return () => {
-      window.removeEventListener("resize", updateGlobeSize);
-    };
+    return () => window.removeEventListener("resize", updateSize);
   }, []);
 
+  useEffect(() => {
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setSelectedCode(null);
+      }
+    }
+
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, []);
+
+  // Only countries that actually have chart data are interactive.
   const polygons = useMemo(() => {
-    if (!geoData) {
+    if (!geoData || !dataset) {
       return [];
     }
 
-    return geoData.features.filter(
-      (feature) => getCountryCode(feature) !== "AQ",
+    return geoData.features.filter((feature) => {
+      const code = getCountryCode(feature);
+      return code !== null && Boolean(dataset.countries[code]);
+    });
+  }, [geoData, dataset]);
+
+  // Soft white outline drawn just above every charting country's border.
+  const borderPaths = useMemo<BorderPath[]>(() => {
+    return polygons.flatMap((feature) =>
+      extractRings(feature as CountryFeature).map((ring) => ({
+        points: ringToPath(ring),
+        kind: "border" as const,
+      })),
     );
-  }, [geoData]);
+  }, [polygons]);
 
-  const selectedCountry = dataset?.countries[selectedCode] ?? null;
-  const widestTrend = dataset?.global_trends?.[0] ?? null;
+  // The selected country's border, doubled up: a wide soft glow + a bright
+  // metallic core. No fill — outline only.
+  const selectedPaths = useMemo<BorderPath[]>(() => {
+    if (!selectedCode || !geoData) {
+      return [];
+    }
 
-  function getPolygonLabel(polygon: object) {
-    const feature = polygon as CountryFeature;
-    const code = getCountryCode(feature);
-    const country = code && dataset
-      ? dataset.countries[code]
-      : null;
+    const feature = geoData.features.find(
+      (item) => getCountryCode(item) === selectedCode,
+    );
+    if (!feature) {
+      return [];
+    }
 
-    if (!country) {
+    return extractRings(feature).flatMap((ring) => {
+      const points = ringToPath(ring);
+      return [
+        { points, kind: "glow" as const },
+        { points, kind: "core" as const },
+      ];
+    });
+  }, [selectedCode, geoData]);
+
+  const pathsData = useMemo(
+    () => [...borderPaths, ...selectedPaths],
+    [borderPaths, selectedPaths],
+  );
+
+  const pathPoints = useCallback(
+    (path: object) => (path as BorderPath).points,
+    [],
+  );
+
+  const pathPointAlt = useCallback(
+    (path: object) => ((path as BorderPath).kind === "border" ? 0.006 : 0.064),
+    [],
+  );
+
+  const pathColor = useCallback((path: object) => {
+    switch ((path as BorderPath).kind) {
+      case "core":
+        // Liquid-metal sheen swept along the outline.
+        return ["#ffffff", "#bcd4ff", "#efe2ff", "#cfe0ff", "#ffffff"];
+      case "glow":
+        return "rgba(255, 255, 255, 0.18)";
+      default:
+        return "rgba(255, 255, 255, 0.32)";
+    }
+  }, []);
+
+  const pathStroke = useCallback((path: object) => {
+    switch ((path as BorderPath).kind) {
+      case "glow":
+        return 4.5;
+      case "core":
+        return 1.7;
+      default:
+        return 0; // falsy -> thin line for ordinary borders
+    }
+  }, []);
+
+  const handleGlobeReady = useCallback(() => {
+    const globe = globeRef.current;
+    if (!globe) {
+      return;
+    }
+
+    // Set the opening view once — the camera is never moved again on select.
+    globe.pointOfView({ lat: 18, lng: 8, altitude: 2.5 }, 0);
+
+    const controls = globe.controls();
+    if (controls) {
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 0.35;
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.12;
+      controls.minDistance = 175;
+      controls.maxDistance = 520;
+    }
+  }, []);
+
+  // Pause the idle spin while a country panel is open; do not recenter.
+  useEffect(() => {
+    const controls = globeRef.current?.controls?.();
+    if (controls) {
+      controls.autoRotate = selectedCode === null;
+    }
+  }, [selectedCode]);
+
+  const polygonCapColor = useCallback(
+    (polygon: object) => {
+      const code = getCountryCode(polygon as CountryFeature);
+
+      // Selected country is outline-only — effectively no fill.
+      if (code && code === selectedCode) {
+        return "rgba(255, 255, 255, 0.04)";
+      }
+
+      if (code && code === hoverCode) {
+        return "rgba(255, 255, 255, 0.1)";
+      }
+
+      return "rgba(120, 175, 255, 0.03)";
+    },
+    [selectedCode, hoverCode],
+  );
+
+  const polygonAltitude = useCallback(
+    (polygon: object) => {
+      const code = getCountryCode(polygon as CountryFeature);
+
+      if (code && code === selectedCode) {
+        return 0.06;
+      }
+
+      if (code && code === hoverCode) {
+        return 0.02;
+      }
+
+      return 0.006;
+    },
+    [selectedCode, hoverCode],
+  );
+
+  const polygonSideColor = useCallback(
+    (polygon: object) => {
+      const code = getCountryCode(polygon as CountryFeature);
+      return code && code === selectedCode
+        ? "rgba(214, 228, 255, 0.08)"
+        : "rgba(120, 170, 255, 0.1)";
+    },
+    [selectedCode],
+  );
+
+  const polygonStrokeColor = useCallback(
+    (polygon: object) => {
+      const code = getCountryCode(polygon as CountryFeature);
+
+      if (code && code === selectedCode) {
+        return "rgba(255, 255, 255, 0.9)";
+      }
+
+      if (code && code === hoverCode) {
+        return "rgba(255, 255, 255, 0.7)";
+      }
+
+      // A bit more visible than before, to read as a soft border.
+      return "rgba(255, 255, 255, 0.42)";
+    },
+    [selectedCode, hoverCode],
+  );
+
+  const polygonLabel = useCallback(
+    (polygon: object) => {
+      const feature = polygon as CountryFeature;
+      const code = getCountryCode(feature);
+      const country = code ? dataset?.countries[code] : null;
+
+      if (!country) {
+        return `
+          <div class="globe-tooltip">
+            <strong>${escapeHtml(getCountryName(feature))}</strong>
+            <span>No chart data</span>
+          </div>
+        `;
+      }
+
       return `
         <div class="globe-tooltip">
-          <strong>${escapeHtml(getCountryName(feature))}</strong>
-          <span>No chart data available</span>
+          <span class="kicker">${escapeHtml(country.country_code)}</span>
+          <strong>${escapeHtml(country.country_name)}</strong>
+          <span>${escapeHtml(country.dominant_category)} leads the chart</span>
+          <span class="title">#1 ${escapeHtml(country.top_video.title)}</span>
         </div>
       `;
-    }
+    },
+    [dataset],
+  );
 
-    return `
-      <div class="globe-tooltip">
-        <span class="tooltip-kicker">${escapeHtml(country.country_code)}</span>
-        <strong>${escapeHtml(country.country_name)}</strong>
-        <span>${escapeHtml(country.dominant_category)} leads the chart</span>
-        <span class="tooltip-title">#1 ${escapeHtml(country.top_video.title)}</span>
-      </div>
-    `;
-  }
+  const handlePolygonClick = useCallback(
+    (polygon: object) => {
+      const code = getCountryCode(polygon as CountryFeature);
+      const country = code ? dataset?.countries[code] : null;
+      if (code && country) {
+        setHasInteracted(true);
+        setSelectedCode(code);
+        setDrawerCountry(country);
+      }
+    },
+    [dataset],
+  );
 
-  function selectPolygon(polygon: object) {
-    const feature = polygon as CountryFeature;
-    const code = getCountryCode(feature);
-
-    if (code && dataset?.countries[code]) {
-      setSelectedCode(code);
-    }
-  }
+  const handlePolygonHover = useCallback((polygon: object | null) => {
+    setHoverCode(
+      polygon ? getCountryCode(polygon as CountryFeature) : null,
+    );
+  }, []);
 
   if (error) {
     return (
@@ -271,270 +381,82 @@ export default function Home() {
     );
   }
 
+  const ready = Boolean(dataset && geoData);
+
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <div className="brand-mark">VP</div>
-
-          <div>
-            <p className="eyebrow">Global YouTube intelligence</p>
-            <h1>VideoPulse Atlas</h1>
-          </div>
+    <main className="globe-view">
+      {!ready && (
+        <div className="globe-loading">
+          <div className="orbit" />
+          <p>Mapping global chart signals</p>
         </div>
+      )}
 
-        <div className="live-status">
-          <span className="live-dot" />
-          Chart snapshot
+      {ready && (
+        <div
+          className="globe-canvas"
+          onPointerDown={() => setHasInteracted(true)}
+        >
+          <Globe
+            ref={globeRef}
+            width={size.width}
+            height={size.height}
+            onGlobeReady={handleGlobeReady}
+            backgroundColor="#00000a"
+            backgroundImageUrl="/textures/night-sky.png"
+            globeImageUrl="/textures/earth-blue-marble.jpg"
+            bumpImageUrl="/textures/earth-topology.png"
+            showAtmosphere
+            atmosphereColor="#8fc4ff"
+            atmosphereAltitude={0.16}
+            polygonsData={polygons}
+            polygonAltitude={polygonAltitude}
+            polygonCapColor={polygonCapColor}
+            polygonSideColor={polygonSideColor}
+            polygonStrokeColor={polygonStrokeColor}
+            polygonLabel={polygonLabel}
+            polygonsTransitionDuration={220}
+            onPolygonClick={handlePolygonClick}
+            onPolygonHover={handlePolygonHover}
+            pathsData={pathsData}
+            pathPoints={pathPoints}
+            pathPointAlt={pathPointAlt}
+            pathColor={pathColor}
+            pathStroke={pathStroke}
+            pathResolution={2}
+            pathTransitionDuration={0}
+          />
+        </div>
+      )}
+
+      <header className="app-header">
+        <div className="brand-mark">VP</div>
+        <div className="brand-text">
+          <p className="eyebrow">Global YouTube intelligence</p>
+          <h1>VideoPulse Atlas</h1>
         </div>
       </header>
 
-      <section className="summary-strip">
-        <div className="summary-item">
-          <span>Regions mapped</span>
-          <strong>{dataset?.country_count ?? "..."}</strong>
+      {ready && (
+        <div
+          className={`globe-hint${
+            hasInteracted || selectedCode ? " is-hidden" : ""
+          }`}
+        >
+          <span className="dot" />
+          Drag to spin the globe · click a country for its charts
         </div>
+      )}
 
-        <div className="summary-item">
-          <span>Unique videos</span>
-          <strong>{dataset?.video_count ?? "..."}</strong>
-        </div>
-
-        <div className="summary-item wide">
-          <span>Largest cross border trend</span>
-          <strong>
-            {widestTrend
-              ? `${widestTrend.title} · ${widestTrend.countries_charting} regions`
-              : "Loading chart data"}
-          </strong>
-        </div>
-
-        <div className="summary-item">
-          <span>Collected</span>
-          <strong>
-            {dataset
-              ? formatSnapshotDate(dataset.generated_at)
-              : "..."}
-          </strong>
-        </div>
-      </section>
-
-      <section className="dashboard">
-        <div className="globe-panel">
-          <div className="globe-heading">
-            <div>
-              <p className="eyebrow">Explore the chart</p>
-              <h2>What is the world watching?</h2>
-            </div>
-
-            <p className="globe-instruction">
-              Hover to inspect. Select a country to open its chart.
-            </p>
-          </div>
-
-          {!dataset || !geoData ? (
-            <div className="loading-state">
-              <div className="loading-orbit" />
-              <p>Mapping global chart signals</p>
-            </div>
-          ) : (
-            <div className="globe-stage">
-              <Globe
-                width={globeSize.width}
-                height={globeSize.height}
-                backgroundColor="rgba(0,0,0,0)"
-                showAtmosphere
-                atmosphereColor="#54d6ff"
-                atmosphereAltitude={0.16}
-                polygonsData={polygons}
-                polygonAltitude={(polygon) => {
-                  const feature = polygon as CountryFeature;
-                  const code = getCountryCode(feature);
-
-                  if (code === selectedCode) {
-                    return 0.055;
-                  }
-
-                  return code && dataset.countries[code]
-                    ? 0.025
-                    : 0.008;
-                }}
-                polygonCapColor={(polygon) => {
-                  const feature = polygon as CountryFeature;
-                  const code = getCountryCode(feature);
-                  const country = code
-                    ? dataset.countries[code]
-                    : null;
-
-                  if (code === selectedCode) {
-                    return "#ffffff";
-                  }
-
-                  return country
-                    ? getCategoryColor(country.dominant_category)
-                    : "#1a2232";
-                }}
-                polygonSideColor={() => "rgba(10, 16, 28, 0.72)"}
-                polygonStrokeColor={() => "rgba(255, 255, 255, 0.2)"}
-                polygonLabel={getPolygonLabel}
-                onPolygonClick={selectPolygon}
-              />
-            </div>
-          )}
-
-          <div className="legend">
-            {Object.entries(CATEGORY_COLORS)
-              .slice(0, 6)
-              .map(([category, color]) => (
-                <div className="legend-item" key={category}>
-                  <span style={{ backgroundColor: color }} />
-                  {category}
-                </div>
-              ))}
-          </div>
-        </div>
-
-        <aside className="country-panel">
-          {selectedCountry ? (
-            <>
-              <div className="country-header">
-                <div>
-                  <p className="eyebrow">
-                    {selectedCountry.country_code}
-                  </p>
-                  <h2>{selectedCountry.country_name}</h2>
-                </div>
-
-                <div
-                  className="category-badge"
-                  style={{
-                    color: getCategoryColor(
-                      selectedCountry.dominant_category,
-                    ),
-                  }}
-                >
-                  {selectedCountry.dominant_category}
-                </div>
-              </div>
-
-              <a
-                className="feature-card"
-                href={`https://www.youtube.com/watch?v=${selectedCountry.top_video.video_id}`}
-                target="_blank"
-                rel="noreferrer"
-              >
-                {selectedCountry.top_video.thumbnail_url && (
-                  <img
-                    src={selectedCountry.top_video.thumbnail_url}
-                    alt=""
-                  />
-                )}
-
-                <div className="feature-overlay" />
-
-                <div className="feature-copy">
-                  <span className="rank-label">Number one</span>
-                  <h3>{selectedCountry.top_video.title}</h3>
-                  <p>{selectedCountry.top_video.channel_name}</p>
-
-                  <div className="video-metrics">
-                    <span>
-                      {formatNumber(
-                        selectedCountry.top_video.global_view_count,
-                      )}{" "}
-                      global views
-                    </span>
-
-                    <span>
-                      {selectedCountry.top_video.countries_charting}{" "}
-                      regions
-                    </span>
-                  </div>
-                </div>
-              </a>
-
-              <section className="panel-section">
-                <div className="section-heading">
-                  <h3>Category signal</h3>
-                  <span>Rank weighted</span>
-                </div>
-
-                <div className="category-list">
-                  {selectedCountry.category_scores
-                    .slice(0, 4)
-                    .map((category) => {
-                      const maximum =
-                        selectedCountry.category_scores[0]
-                          ?.rank_points || 1;
-
-                      return (
-                        <div
-                          className="category-row"
-                          key={category.category_name}
-                        >
-                          <div className="category-copy">
-                            <span>{category.category_name}</span>
-                            <strong>{category.rank_points}</strong>
-                          </div>
-
-                          <div className="category-track">
-                            <div
-                              style={{
-                                width: `${
-                                  (category.rank_points / maximum) * 100
-                                }%`,
-                                backgroundColor: getCategoryColor(
-                                  category.category_name,
-                                ),
-                              }}
-                            />
-                          </div>
-                        </div>
-                      );
-                    })}
-                </div>
-              </section>
-
-              <section className="panel-section">
-                <div className="section-heading">
-                  <h3>Chart leaders</h3>
-                  <span>Top five</span>
-                </div>
-
-                <div className="ranking-list">
-                  {selectedCountry.top_videos
-                    .slice(0, 5)
-                    .map((video) => (
-                      <a
-                        href={`https://www.youtube.com/watch?v=${video.video_id}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="ranking-row"
-                        key={video.video_id}
-                      >
-                        <span className="ranking-number">
-                          {video.rank}
-                        </span>
-
-                        <div>
-                          <strong>{video.title}</strong>
-                          <span>
-                            {video.channel_name} ·{" "}
-                            {video.category_name}
-                          </span>
-                        </div>
-                      </a>
-                    ))}
-                </div>
-              </section>
-            </>
-          ) : (
-            <div className="empty-country">
-              <p>Select a highlighted country to inspect its chart.</p>
-            </div>
-          )}
-        </aside>
-      </section>
+      <div
+        className={`drawer-scrim${selectedCode ? " is-open" : ""}`}
+        aria-hidden="true"
+      />
+      <CountryDrawer
+        country={drawerCountry}
+        isOpen={selectedCode !== null}
+        onClose={() => setSelectedCode(null)}
+      />
     </main>
   );
 }

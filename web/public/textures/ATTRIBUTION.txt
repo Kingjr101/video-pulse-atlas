@@ -1,0 +1,16 @@
+Earth Texture Assets Attribution
+==================================
+
+Sources:
+- earth-night.jpg: NASA Visible Earth project, city lights night time satellite image
+- earth-topology.png: Natural Earth 50m raster elevation data
+
+These assets are sourced from the three-globe example assets repository:
+https://cdn.jsdelivr.net/npm/three-globe/example/img/
+
+Used under the terms of the three-globe library (MIT License) and Natural Earth data 
+(public domain).
+
+Reference:
+https://github.com/vasturiano/three-globe
+https://www.naturalearthdata.com/
